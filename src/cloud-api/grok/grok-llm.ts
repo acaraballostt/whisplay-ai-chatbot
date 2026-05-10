@@ -26,7 +26,12 @@ dotenv.config();
 
 // Grok LLM
 const grokAccessToken = process.env.GROK_API_KEY || "";
-const grokLLMModel = process.env.GROK_LLM_MODEL || "grok-4-latest"; // Default model
+const grokLLMModel = process.env.GROK_LLM_MODEL || "grok-4-latest";
+const grokWebSearchEnabled  = process.env.GROK_WEB_SEARCH_ENABLED  === "true";
+const grokXSearchEnabled   = process.env.GROK_X_SEARCH_ENABLED   === "true";
+const grokCodeExecEnabled  = process.env.GROK_CODE_EXECUTION_ENABLED === "true";
+const grokStoreResponses    = process.env.GROK_STORE_RESPONSES !== "false";
+const grokTemperature = parseFloat(process.env.GROK_TEMPERATURE || "0.7");
 
 const chatHistoryFileName = `grok_chat_history_${moment().format(
   "YYYY-MM-DD_HH-mm-ss",
@@ -38,6 +43,11 @@ const messages: Message[] = [
     content: systemPrompt,
   },
 ];
+
+const nativeTools: object[] = [];
+if (grokWebSearchEnabled)  nativeTools.push({ type: "web_search" });
+if (grokXSearchEnabled)   nativeTools.push({ type: "x_search" });
+if (grokCodeExecEnabled)  nativeTools.push({ type: "code_execution" });
 
 const resetChatHistory = (): void => {
   messages.length = 0;
@@ -73,17 +83,17 @@ const chatWithLLMStream: ChatWithLLMStreamFunction = async (
     );
   });
   let partialAnswer = "";
-  const functionCallsPackages: any[] = [];
 
   try {
     const response = await axios.post(
-      "https://api.x.ai/v1/chat/completions",
+      "https://api.x.ai/v1/responses",
       {
         model: grokLLMModel,
-        messages,
+        input: messages,
         stream: true,
-        tools: llmTools,
-        temperature: 0.7,
+        tools: [...nativeTools, ...llmTools],
+        store: grokStoreResponses,
+        temperature: grokTemperature,
       },
       {
         headers: {
@@ -94,130 +104,59 @@ const chatWithLLMStream: ChatWithLLMStreamFunction = async (
       },
     );
 
+    let toolUsageStats: any = {};
+
     response.data.on("data", (chunk: Buffer) => {
       const data = chunk.toString();
-      const dataLines = data.split("\n");
-      const filteredLines = dataLines.filter((line) => line.trim() !== "");
-      const filteredData = filteredLines.map((line) =>
-        line.replace(/^data:\s*/, ""),
-      );
+      const lines = data.split("\n");
 
-      try {
-        const parsedData = filteredData.map((line) => {
-          if (line === "[DONE]") {
-            return {}; // Handle end marker
+      for (const line of lines) {
+        if (!line.trim() || line === "data: [DONE]") continue;
+        const jsonStr = line.replace(/^data:\s*/, "");
+        try {
+          const obj = JSON.parse(jsonStr);
+
+          // Responses API streaming: output array with typed items
+          const output = obj.output || [];
+          for (const item of output) {
+            if (item.type === "reasoning") {
+              const text = item.summary?.map((s: any) => s.text).join("") || "";
+              if (text) partialThinkingCallback?.(text);
+            }
+            if (item.type === "message") {
+              for (const content of item.content || []) {
+                if (content.type === "output_text") {
+                  const text = content.text || "";
+                  if (text) {
+                    partialCallback(text);
+                    partialAnswer += text;
+                  }
+                }
+              }
+            }
           }
-          return JSON.parse(line);
-        });
 
-        const answer = parsedData
-          .map((item) => get(item, "choices[0].delta.content", ""))
-          .join("");
-        const toolCalls = parsedData
-          .map((item) => get(item, "choices[0].delta.tool_calls", []))
-          .filter((arr) => !isEmpty(arr));
-
-        if (toolCalls.length) {
-          functionCallsPackages.push(...toolCalls);
+          // Log server-side tool usage in streaming (verbose_streaming)
+          if (obj.server_side_tool_usage_details) {
+            toolUsageStats = obj.server_side_tool_usage_details;
+          }
+        } catch (e) {
+          // ignore parse errors for non-JSON SSE events
         }
-        if (answer) {
-          partialCallback(answer);
-          partialAnswer += answer;
-        }
-      } catch (error) {
-        console.error("Error parsing data:", error, data);
       }
     });
 
     response.data.on("end", async () => {
       console.log("Stream ended");
-      const functionCalls = combineFunction(functionCallsPackages);
-      console.log("functionCalls: ", JSON.stringify(functionCalls));
+      console.log("[Grok] Tool usage:", JSON.stringify(toolUsageStats));
+
       messages.push({
         role: "assistant",
         content: partialAnswer,
-        tool_calls: functionCalls,
       });
 
-      if (!isEmpty(functionCalls)) {
-        const results = await Promise.all(
-          functionCalls.map(async (call: FunctionCall) => {
-            const {
-              function: { arguments: argString, name },
-              id,
-            } = call;
-            let args: Record<string, any> = {};
-            try {
-              args = JSON.parse(argString || "{}");
-            } catch {
-              console.error(
-                `Error parsing arguments for function ${name}:`,
-                argString,
-              );
-            }
-            const func = llmFuncMap[name! as string];
-            invokeFunctionCallback?.(name! as string);
-            if (func) {
-              return [
-                id,
-                await func(args)
-                  .then((res) => {
-                    invokeFunctionCallback?.(name! as string, res);
-                    return res;
-                  })
-                  .catch((err) => {
-                    console.error(`Error executing function ${name}:`, err);
-                    return `Error executing function ${name}: ${err.message}`;
-                  }),
-              ];
-            } else {
-              console.error(`Function ${name} not found`);
-              return [id, `Function ${name} not found`];
-            }
-          }),
-        );
-
-        console.log("call results: ", results);
-        const newMessages: Message[] = results.map(([id, result]: any) => ({
-          role: "tool",
-          content: result as string,
-          tool_call_id: id as string,
-        }));
-
-        // Directly extract and return the tool result if available
-        const describeMessage = newMessages.find((msg) =>
-          msg.content.startsWith(ToolReturnTag.Response),
-        );
-        const responseContent = extractToolResponse(
-          describeMessage?.content || "",
-        );
-        if (responseContent) {
-          console.log(
-            `[LLM] Tool response starts with "[response]", return it directly.`,
-          );
-          newMessages.push({
-            role: "assistant",
-            content: responseContent,
-          });
-          // append responseContent in chunks
-          await stimulateStreamResponse({
-            content: responseContent,
-            partialCallback,
-            endResolve,
-            endCallback,
-          });
-          return;
-        }
-
-        await chatWithLLMStream(newMessages, partialCallback, () => {
-          endResolve();
-          endCallback();
-        });
-        return;
-      } else {
-        endResolve();
-        endCallback();
-      }
+      endResolve();
+      endCallback();
     });
   } catch (error: any) {
     console.error("Error:", error.message);
@@ -236,16 +175,13 @@ const summaryTextWithLLM: SummaryTextWithLLMFunction = async (
   }
   const response = await axios
     .post(
-      "https://api.x.ai/v1/chat/completions",
+      "https://api.x.ai/v1/responses",
       {
         model: grokLLMModel,
-        messages: [
-          {
-            role: "user",
-            content: `${promptPrefix}\n\n${text}\n\n`,
-          },
+        input: [
+          { role: "user", content: `${promptPrefix}\n\n${text}` }
         ],
-        stream: false,
+        store: false,
       },
       {
         headers: {
@@ -261,7 +197,10 @@ const summaryTextWithLLM: SummaryTextWithLLMFunction = async (
   if (!response) {
     return text;
   }
-  const summary = get(response, "data.choices[0].message.content", "");
+  const output = get(response, "data.output", []) as any[];
+  const summary = output
+    .find((item: any) => item.type === "message")
+    ?.content?.find((c: any) => c.type === "output_text")?.text || "";
 
   if (summary) {
     console.log("Grok summary:", summary);
