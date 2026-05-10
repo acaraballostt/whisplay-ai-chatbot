@@ -68,6 +68,7 @@ const chatWithLLMStream: ChatWithLLMStreamFunction = async (
     console.error("Grok access token is not set.");
     return;
   }
+  console.log(`[Grok] Calling API with ${inputMessages.length} input messages, nativeTools: ${nativeTools.length}`);
   if (shouldResetChatHistory()) {
     resetChatHistory();
   }
@@ -91,7 +92,7 @@ const chatWithLLMStream: ChatWithLLMStreamFunction = async (
         model: grokLLMModel,
         input: messages,
         stream: true,
-        tools: [...nativeTools, ...llmTools],
+        tools: [...nativeTools],
         store: grokStoreResponses,
         temperature: grokTemperature,
       },
@@ -101,6 +102,7 @@ const chatWithLLMStream: ChatWithLLMStreamFunction = async (
           Authorization: `Bearer ${grokAccessToken}`,
         },
         responseType: "stream",
+        timeout: 30000,
       },
     );
 
@@ -159,7 +161,15 @@ const chatWithLLMStream: ChatWithLLMStreamFunction = async (
       endCallback();
     });
   } catch (error: any) {
-    console.error("Error:", error.message);
+    console.error("Grok API Error:", {
+      status: error.response?.status,
+      statusText: error.response?.statusText,
+      data: error.response?.data,
+      message: error.message,
+      code: error.code,
+    });
+    endResolve();
+    endCallback();
   }
 
   return promise;
