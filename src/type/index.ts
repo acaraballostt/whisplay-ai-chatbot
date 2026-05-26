@@ -130,6 +130,8 @@ export interface LLMTool {
             }
             required?: string[]
           }
+          maxItems?: number
+          minItems?: number
         }
       }
       items?: {
